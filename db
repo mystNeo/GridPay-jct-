@@ -1,0 +1,209 @@
+"""
+db.py — SQLite schema + helper functions for GRID-PAY.
+
+Everything lives in one local file (grid_pay.db) so the whole project
+runs with zero external services. Swap DB_PATH for a Postgres/Supabase
+connection string later if you want a "real" backend without changing
+the rest of the code much.
+"""
+
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from contextlib import contextmanager
+
+DB_PATH = "grid_pay.db"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db(reset: bool = False):
+    """Create all tables. Pass reset=True to wipe and start fresh."""
+    with get_conn() as conn:
+        if reset:
+            for table in ["readings", "transactions", "ledger", "alerts", "wallets", "meters"]:
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS meters (
+                meter_id TEXT PRIMARY KEY,
+                owner_name TEXT,
+                avg_generation_kwh REAL DEFAULT 0
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS wallets (
+                meter_id TEXT PRIMARY KEY,
+                balance REAL DEFAULT 0
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                meter_id TEXT,
+                ts TEXT,
+                kwh_generated REAL,
+                kwh_consumed REAL,
+                status TEXT,              -- ok | dropped | duplicate | malformed
+                ingested_at TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                meter_id TEXT,
+                reading_id INTEGER,
+                ts TEXT,
+                kwh_settled REAL,
+                tariff_rate REAL,
+                amount REAL,
+                payment_ref TEXT,
+                status TEXT               -- settled | failed
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                meter_id TEXT,
+                window_start TEXT,
+                window_end TEXT,
+                reported_kwh REAL,
+                ingested_kwh REAL,
+                variance_pct REAL,
+                status TEXT,              -- clean | variance_flagged
+                reconciled_at TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                meter_id TEXT,
+                ts TEXT,
+                reason TEXT,
+                message TEXT,
+                resolved INTEGER DEFAULT 0
+            )
+        """)
+
+
+def ensure_meter(meter_id: str, owner_name: str = ""):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO meters (meter_id, owner_name) VALUES (?, ?)",
+            (meter_id, owner_name or meter_id),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO wallets (meter_id, balance) VALUES (?, 0)",
+            (meter_id,),
+        )
+
+
+def insert_reading(meter_id, ts, kwh_generated, kwh_consumed, status):
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO readings (meter_id, ts, kwh_generated, kwh_consumed, status, ingested_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (meter_id, ts, kwh_generated, kwh_consumed, status, now_iso()),
+        )
+        return cur.lastrowid
+
+
+def insert_transaction(meter_id, reading_id, kwh_settled, tariff_rate, amount, status="settled"):
+    payment_ref = f"PAY-{uuid.uuid4().hex[:10].upper()}"
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO transactions
+               (meter_id, reading_id, ts, kwh_settled, tariff_rate, amount, payment_ref, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (meter_id, reading_id, now_iso(), kwh_settled, tariff_rate, amount, payment_ref, status),
+        )
+        conn.execute(
+            "UPDATE wallets SET balance = balance + ? WHERE meter_id = ?",
+            (amount, meter_id),
+        )
+    return payment_ref
+
+
+def insert_ledger_entry(meter_id, window_start, window_end, reported_kwh, ingested_kwh, variance_pct, status):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO ledger
+               (meter_id, window_start, window_end, reported_kwh, ingested_kwh, variance_pct, status, reconciled_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (meter_id, window_start, window_end, reported_kwh, ingested_kwh, variance_pct, status, now_iso()),
+        )
+
+
+def insert_alert(meter_id, reason, message):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO alerts (meter_id, ts, reason, message) VALUES (?, ?, ?, ?)",
+            (meter_id, now_iso(), reason, message),
+        )
+
+
+def get_recent_readings(meter_id, limit=20):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM readings WHERE meter_id = ? AND status = 'ok' ORDER BY id DESC LIMIT ?",
+            (meter_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def fetch_all(table, limit=200):
+    with get_conn() as conn:
+        rows = conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_wallet_balances():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM wallets ORDER BY balance DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_summary_metrics():
+    with get_conn() as conn:
+        total_tx = conn.execute("SELECT COUNT(*) c FROM transactions").fetchone()["c"]
+        total_payout = conn.execute("SELECT COALESCE(SUM(amount),0) s FROM transactions").fetchone()["s"]
+        total_kwh = conn.execute("SELECT COALESCE(SUM(kwh_settled),0) s FROM transactions").fetchone()["s"]
+        open_alerts = conn.execute("SELECT COUNT(*) c FROM alerts WHERE resolved = 0").fetchone()["c"]
+        flagged_ledger = conn.execute("SELECT COUNT(*) c FROM ledger WHERE status = 'variance_flagged'").fetchone()["c"]
+    return {
+        "total_transactions": total_tx,
+        "total_payout": round(total_payout, 2),
+        "total_clean_kwh": round(total_kwh, 2),
+        "open_alerts": open_alerts,
+        "flagged_ledger_entries": flagged_ledger,
+    }
+
+
+
+
+
+
+
+
+
+
+                     
