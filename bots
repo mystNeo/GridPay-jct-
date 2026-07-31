@@ -1,0 +1,200 @@
+"""
+bots.py — the four "specialist agents" from the problem statement, plus
+the HITL safety guardrail. Each is a plain function: fast, deterministic,
+and easy to explain to judges. The LLM is only called from the HITL bot,
+where natural-language judgement actually adds value.
+"""
+
+import random
+import statistics
+from datetime import datetime, timezone
+
+import db
+from llm_utils import explain_anomaly
+
+DUPLICATE_SEEN = set()  # in-memory guard against re-processing the same (meter, ts)
+
+BASE_TARIFF = 6.0        # ₹ per kWh baseline feed-in tariff
+TAMPER_THRESHOLD = 2.2   # flag if a reading is > 2.2x the meter's rolling average
+LEDGER_TOLERANCE_PCT = 5.0  # acceptable reconciliation variance
+
+
+# ---------------------------------------------------------------------------
+# 1. Meter Telemetry Ingestion Bot
+# ---------------------------------------------------------------------------
+def ingestion_bot(raw_reading: dict) -> dict | None:
+    """
+    Validates a raw reading and writes it to the DB.
+    Returns the stored reading (with its DB id) if usable, else None.
+    Handles the three failure modes the simulator injects: dropped,
+    malformed, and duplicate readings — this is the "network disconnect
+    resilience" the problem statement asks for.
+    """
+    meter_id = raw_reading.get("meter_id")
+    ts = raw_reading.get("ts")
+    generated = raw_reading.get("kwh_generated")
+    consumed = raw_reading.get("kwh_consumed", 0)
+
+    db.ensure_meter(meter_id)
+
+    # Dropped / malformed packet — log it, don't crash the pipeline
+    if generated is None:
+        db.insert_reading(meter_id, ts, 0, consumed or 0, status="dropped")
+        return None
+
+    # Duplicate transmission — dedupe on (meter, timestamp)
+    dedupe_key = (meter_id, ts)
+    if dedupe_key in DUPLICATE_SEEN:
+        db.insert_reading(meter_id, ts, generated, consumed, status="duplicate")
+        return None
+    DUPLICATE_SEEN.add(dedupe_key)
+
+    reading_id = db.insert_reading(meter_id, ts, generated, consumed, status="ok")
+    return {"id": reading_id, "meter_id": meter_id, "ts": ts,
+            "kwh_generated": generated, "kwh_consumed": consumed}
+
+
+# ---------------------------------------------------------------------------
+# 2. Dynamic Tariff Calculation Agent
+# ---------------------------------------------------------------------------
+def tariff_agent(kwh_generated: float, grid_supply_kwh: float, grid_demand_kwh: float) -> float:
+    """
+    Simple, explainable supply/demand curve:
+      - if demand > supply, tariff rises (grid needs the power more)
+      - if supply > demand, tariff falls (grid is oversupplied)
+    Clamped so it stays in a believable ₹4–10/kWh band for the demo.
+    """
+    if grid_supply_kwh <= 0:
+        ratio = 1.0
+    else:
+        ratio = grid_demand_kwh / grid_supply_kwh
+
+    rate = BASE_TARIFF * (0.7 + 0.6 * min(ratio, 2.0))
+    return round(max(4.0, min(rate, 10.0)), 2)
+
+
+# ---------------------------------------------------------------------------
+# 3. Financial Settlement RPA
+# ---------------------------------------------------------------------------
+def settlement_rpa(reading: dict, tariff_rate: float) -> dict:
+    """Executes the micro-payout and books the transaction."""
+    kwh = reading["kwh_generated"]
+    amount = round(kwh * tariff_rate, 2)
+    payment_ref = db.insert_transaction(
+        meter_id=reading["meter_id"],
+        reading_id=reading["id"],
+        kwh_settled=kwh,
+        tariff_rate=tariff_rate,
+        amount=amount,
+        status="settled",
+    )
+    return {"payment_ref": payment_ref, "amount": amount}
+
+
+# ---------------------------------------------------------------------------
+# 4. Utility Ledger Reconciliation Bot
+# ---------------------------------------------------------------------------
+def reconciliation_bot(meter_id: str, reported_kwh: float, ingested_kwh: float,
+                        window_start: str, window_end: str) -> dict:
+    """
+    Compares what the meter reported vs what actually made it through
+    ingestion (accounting for grid losses / dropped packets), and flags
+    anything outside tolerance instead of silently absorbing the gap.
+    """
+    if reported_kwh <= 0:
+        variance_pct = 0.0
+    else:
+        variance_pct = round(abs(reported_kwh - ingested_kwh) / reported_kwh * 100, 2)
+
+    status = "variance_flagged" if variance_pct > LEDGER_TOLERANCE_PCT else "clean"
+    db.insert_ledger_entry(meter_id, window_start, window_end,
+                            reported_kwh, ingested_kwh, variance_pct, status)
+    return {"variance_pct": variance_pct, "status": status}
+
+
+# ---------------------------------------------------------------------------
+# 5. HITL Guardrail — anomaly / tampering detection
+# ---------------------------------------------------------------------------
+def hitl_check(meter_id: str, latest_kwh: float) -> dict | None:
+    """
+    Compares the latest reading to the meter's own recent history.
+    If it's a wild outlier, pause it for a human auditor and use the LLM
+    once to turn the raw numbers into a readable alert message.
+    Returns the alert dict if one was raised, else None.
+    """
+    history = db.get_recent_readings(meter_id, limit=15)
+    past_values = [r["kwh_generated"] for r in history if r["id"]]
+    if len(past_values) < 5:
+        return None  # not enough history yet to judge
+
+    avg = statistics.mean(past_values)
+    if avg <= 0:
+        return None
+
+    if latest_kwh > avg * TAMPER_THRESHOLD:
+        message = explain_anomaly(meter_id, latest_kwh, avg)
+        db.insert_alert(meter_id, reason="generation_spike", message=message)
+        return {"meter_id": meter_id, "reason": "generation_spike", "message": message}
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Orchestration helper — runs one raw reading through the whole pipeline
+# ---------------------------------------------------------------------------
+def run_pipeline_step(raw_reading: dict, grid_supply_kwh: float, grid_demand_kwh: float) -> dict:
+    """
+    Ties all five bots together for a single incoming reading.
+    This is what app.py calls once per simulated meter tick.
+    """
+    log = []
+
+    reading = ingestion_bot(raw_reading)
+    if reading is None:
+        log.append(f"Ingestion bot dropped/deduped a reading from {raw_reading.get('meter_id')}")
+        return {"log": log, "settled": False}
+
+    log.append(f"Ingestion bot accepted reading from {reading['meter_id']} "
+               f"({reading['kwh_generated']} kWh generated)")
+
+    alert = hitl_check(reading["meter_id"], reading["kwh_generated"])
+    if alert:
+        log.append(f"HITL guardrail paused {reading['meter_id']}: {alert['message']}")
+        return {"log": log, "settled": False, "alert": alert}
+
+    tariff_rate = tariff_agent(reading["kwh_generated"], grid_supply_kwh, grid_demand_kwh)
+    log.append(f"Tariff agent priced this reading at ₹{tariff_rate}/kWh")
+
+    settlement = settlement_rpa(reading, tariff_rate)
+    log.append(f"Settlement RPA paid ₹{settlement['amount']} "
+               f"(ref {settlement['payment_ref']}) to {reading['meter_id']}")
+
+    return {"log": log, "settled": True, "reading": reading,
+            "tariff_rate": tariff_rate, "settlement": settlement}
+
+
+def run_reconciliation_sweep(window_start: str, window_end: str) -> list[dict]:
+    """
+    Call this periodically (e.g. every N ticks) to reconcile each meter's
+    reported generation against what was actually ingested in the window.
+    """
+    results = []
+    with db.get_conn() as conn:
+        meters = [r["meter_id"] for r in conn.execute("SELECT meter_id FROM meters").fetchall()]
+
+    for meter_id in meters:
+        with db.get_conn() as conn:
+            reported = conn.execute(
+                "SELECT COALESCE(SUM(kwh_generated),0) s FROM readings WHERE meter_id=? AND status IN ('ok','dropped')",
+                (meter_id,),
+            ).fetchone()["s"]
+            ingested = conn.execute(
+                "SELECT COALESCE(SUM(kwh_generated),0) s FROM readings WHERE meter_id=? AND status='ok'",
+                (meter_id,),
+            ).fetchone()["s"]
+
+        result = reconciliation_bot(meter_id, reported, ingested, window_start, window_end)
+        results.append({"meter_id": meter_id, **result})
+    return results
+
+      
