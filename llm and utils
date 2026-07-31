@@ -1,0 +1,61 @@
+"""
+llm_utils.py — the one place an LLM actually gets called.
+
+Uses Groq's free-tier API (fast + free quota, great for a hackathon) to
+turn a raw anomaly into a human-readable alert. If no API key is set, or
+the call fails for any reason (offline demo, rate limit, etc.), it falls
+back to a template so the app never breaks during a live demo.
+
+Get a free key at https://console.groq.com and set it as an environment
+variable GROQ_API_KEY (or a Streamlit secret — see app.py).
+"""
+
+import os
+
+GROQ_MODEL = "llama-3.1-8b-instant"  # fast + free-tier friendly
+
+
+def _fallback_message(meter_id: str, latest_kwh: float, avg_kwh: float) -> str:
+    multiple = round(latest_kwh / avg_kwh, 1) if avg_kwh else 0
+    return (
+        f"{meter_id} reported {latest_kwh} kWh, about {multiple}x its recent "
+        f"average of {round(avg_kwh, 2)} kWh. This pattern is consistent with "
+        f"meter tampering or a sensor fault. Flagged for human review before "
+        f"any payout is settled."
+    )
+
+
+def explain_anomaly(meter_id: str, latest_kwh: float, avg_kwh: float) -> str:
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        return _fallback_message(meter_id, latest_kwh, avg_kwh)
+
+    try:
+        import requests
+
+        prompt = (
+            f"A rooftop solar meter '{meter_id}' just reported {latest_kwh} kWh "
+            f"of generation, versus its recent average of {round(avg_kwh, 2)} kWh. "
+            f"In one short sentence, explain to a utility auditor why this looks "
+            f"suspicious and that the payout has been paused pending review. "
+            f"Be factual and concise, no more than 30 words."
+        )
+
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 80,
+                "temperature": 0.3,
+            },
+            timeout=6,
+        )
+        response.raise_for_status()
+        text = response.json()["choices"][0]["message"]["content"].strip()
+        return text or _fallback_message(meter_id, latest_kwh, avg_kwh)
+
+    except Exception:
+        # Never let an LLM hiccup break the settlement pipeline
+        return _fallback_message(meter_id, latest_kwh, avg_kwh)
