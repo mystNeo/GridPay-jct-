@@ -1,5 +1,6 @@
 # GridPay-jct-
 An AI + IoT based GenAI model. 
+<img width="1917" height="901" alt="Screenshot 2026-07-31 191633" src="https://github.com/user-attachments/assets/facd535d-7b85-410c-9995-4fd7bd839fb1" />
 
 # GRID-PAY — Intelligent Automation for P2P Renewable Energy Settlement
 
